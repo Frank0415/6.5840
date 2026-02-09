@@ -58,6 +58,8 @@ func Worker(mapf func(string, string) []KeyValue,
 		log.Fatalf("Failed to initialize worker: %v", err)
 	}
 
+	go CallCheckHealth(status.workerId)
+
 	for {
 		reply, err := CallGetWork(status.workerId)
 		if err != nil {
@@ -78,10 +80,10 @@ func Worker(mapf func(string, string) []KeyValue,
 			continue
 		case 1:
 			// Map Work
-			mapFunc(&status, mapf)
+			status.mapFunc(mapf)
 		case 2:
 			// Reduce Work
-			reduceFunc(&status, reducef)
+			status.reduceFunc(reducef)
 		}
 
 	}
@@ -93,7 +95,7 @@ func CallInitWorker() (workerStat, error) {
 
 	ok := call("Coordinator.RegisterWorker", &args, &reply)
 	if ok {
-		fmt.Printf("Worker registered with WorkerId %v\n", reply.WorkerId)
+		log.Printf("Worker registered with WorkerId %v\n", reply.WorkerId)
 		return workerStat{
 			workStatus:  0,
 			workerId:    reply.WorkerId,
@@ -101,7 +103,7 @@ func CallInitWorker() (workerStat, error) {
 			totalReduce: reply.TotalReduce,
 		}, nil
 	} else {
-		fmt.Printf("Worker registration failed!\n")
+		log.Printf("Worker registration failed!\n")
 		return workerStat{}, fmt.Errorf("call failed")
 	}
 }
@@ -115,9 +117,36 @@ func CallGetWork(WId int) (GetWorkReply, error) {
 
 	ok := call("Coordinator.GetWork", &args, &reply)
 	if ok {
+		log.Printf("Worker %v received work: WorkType %v, WorkId %v\n", WId, reply.WorkType, reply.WorkId)
 		return reply, nil
 	} else {
+		log.Printf("Worker %v failed to receive work\n", WId)
 		return GetWorkReply{}, fmt.Errorf("call failed")
+	}
+}
+
+func (w *workerStat) CallFinishWork(workType int) {
+	args := FinishWorkArgs{}
+	args.WorkerId = w.workerId
+	args.WorkId = w.currWork.WorkId
+	args.WorkType = workType
+	reply := FinishWorkReply{}
+	log.Printf("Worker %v finished work: WorkType %v, WorkId %v\n", w.workerId, workType, w.currWork.WorkId)
+	call("Coordinator.FinishWork", &args, &reply)
+}
+
+func CallCheckHealth(WId int) {
+	for {
+		time.Sleep(1 * time.Second)
+		args := CheckHealthArgs{WorkerId: WId}
+		reply := CheckHealthReply{}
+
+		ok := call("Coordinator.CheckHealth", &args, &reply)
+		if ok {
+			log.Printf("Worker %v heartbeat sent\n", WId)
+		} else {
+			log.Printf("Worker %v heartbeat failed!\n", WId)
+		}
 	}
 }
 
@@ -151,7 +180,7 @@ func CallExample() {
 // send an RPC request to the coordinator, wait for the response.
 // usually returns true.
 // returns false if something goes wrong.
-func call(rpcname string, args interface{}, reply interface{}) bool {
+func call(rpcname string, args any, reply any) bool {
 	// c, err := rpc.DialHTTP("tcp", "127.0.0.1"+":1234")
 	sockname := coordinatorSock()
 	c, err := rpc.DialHTTP("unix", sockname)
@@ -169,24 +198,24 @@ func call(rpcname string, args interface{}, reply interface{}) bool {
 	return false
 }
 
-func mapFunc(worker *workerStat, mapf func(string, string) []KeyValue) {
-	inFile, err := os.Open(worker.currWork.inPath)
+func (w *workerStat) mapFunc(mapf func(string, string) []KeyValue) {
+	inFile, err := os.Open(w.currWork.inPath)
 	if err != nil {
-		log.Fatalf("cannot open %v", worker.currWork.inPath)
+		log.Fatalf("cannot open %v", w.currWork.inPath)
 	}
 	content, err := ioutil.ReadAll(inFile)
 	if err != nil {
-		log.Fatalf("cannot read %v", worker.currWork.inPath)
+		log.Fatalf("cannot read %v", w.currWork.inPath)
 	}
 	inFile.Close()
 
-	kva := mapf(worker.currWork.inPath, string(content))
+	kva := mapf(w.currWork.inPath, string(content))
 
 	// Create temp files for intermediate output
 	tempFiles := []*os.File{}
 	tempFileNames := []string{}
-	for i := 0; i < worker.totalReduce; i++ {
-		tempFile, err := os.CreateTemp("", "mr-map-tmp-*")
+	for i := 0; i < w.totalReduce; i++ {
+		tempFile, err := os.CreateTemp(".", "mr-map-tmp-*")
 		if err != nil {
 			log.Fatalf("cannot create temp file")
 		}
@@ -195,45 +224,66 @@ func mapFunc(worker *workerStat, mapf func(string, string) []KeyValue) {
 	}
 
 	for _, kv := range kva {
-		bucket := ihash(kv.Key) % worker.totalReduce
+		bucket := ihash(kv.Key) % w.totalReduce
 		fmt.Fprintf(tempFiles[bucket], "%v %v\n", kv.Key, kv.Value)
 	}
 
 	for i, f := range tempFiles {
 		f.Close()
-		finalName := fmt.Sprintf("mr-%d-%d", worker.currWork.WorkId, i)
-		os.Rename(tempFileNames[i], finalName)
+		finalName := fmt.Sprintf("mr-%d-%d", w.currWork.WorkId, i)
+		err := os.Rename(tempFileNames[i], finalName)
+		if err != nil {
+			log.Fatalf("cannot rename %v to %v: %v", tempFileNames[i], finalName, err)
+		}
 	}
 
-	CallFinishWork(worker, 1)
+	w.CallFinishWork(1)
 }
 
-func reduceFunc(worker *workerStat, reducef func(string, []string) string) {
+func (w *workerStat) reduceFunc(reducef func(string, []string) string) {
 	intermediate := []KeyValue{}
-	for i := 0; i < worker.totalMap; i++ {
-		filename := fmt.Sprintf("mr-%d-%d", i, worker.currWork.ReduceBucket)
-		file, err := os.Open(filename)
-		if err != nil {
-			continue // Some maps might have failed or files missing?
-			// In a real system we'd check if this is an error we can recover from.
-		}
-
-		// Reading formatted output back
-		for {
-			var kv KeyValue
-			n, err := fmt.Fscanf(file, "%v %v\n", &kv.Key, &kv.Value)
-			if n < 2 || err != nil {
-				break
+	var ReadCount []bool
+	var ReadDone int
+	for range w.totalMap {
+		ReadCount = append(ReadCount, false)
+	}
+	// infinite loop to wait for all map outputs to be available
+	for {
+		for i := range w.totalMap {
+			if ReadCount[i] {
+				continue
 			}
-			intermediate = append(intermediate, kv)
+			filename := fmt.Sprintf("mr-%d-%d", i, w.currWork.ReduceBucket)
+			file, err := os.Open(filename)
+			if err != nil {
+				continue // Some maps might have failed or files missing?
+				// In a real system we'd check if this is an error we can recover from.
+			}
+
+			// Reading formatted output back
+			for {
+				var kv KeyValue
+				n, err := fmt.Fscanf(file, "%v %v\n", &kv.Key, &kv.Value)
+				if n < 2 || err != nil {
+					break
+				}
+				intermediate = append(intermediate, kv)
+			}
+			ReadCount[i] = true
+			ReadDone++
+			file.Close()
 		}
-		file.Close()
+		if ReadDone == w.totalMap {
+			break
+		} else {
+			time.Sleep(time.Second)
+		}
 	}
 
 	sort.Sort(ByKey(intermediate))
 
-	oname := fmt.Sprintf("mr-out-%d", worker.currWork.ReduceBucket)
-	tempFile, err := os.CreateTemp("", "mr-reduce-tmp-*")
+	oname := fmt.Sprintf("mr-out-%d", w.currWork.ReduceBucket)
+	tempFile, err := os.CreateTemp(".", "mr-reduce-tmp-*")
 	if err != nil {
 		log.Fatalf("cannot create temp file")
 	}
@@ -256,17 +306,10 @@ func reduceFunc(worker *workerStat, reducef func(string, []string) string) {
 	}
 
 	tempFile.Close()
-	os.Rename(tempFile.Name(), oname)
+	err = os.Rename(tempFile.Name(), oname)
+	if err != nil {
+		log.Fatalf("cannot rename %v to %v: %v", tempFile.Name(), oname, err)
+	}
 
-	CallFinishWork(worker, 2)
-}
-
-func CallFinishWork(worker *workerStat, workType int) {
-	args := FinishWorkArgs{}
-	args.WorkerId = worker.workerId
-	args.WorkId = worker.currWork.WorkId
-	args.WorkType = workType
-	reply := FinishWorkReply{}
-
-	call("Coordinator.FinishWork", &args, &reply)
+	w.CallFinishWork(2)
 }

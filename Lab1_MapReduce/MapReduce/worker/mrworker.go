@@ -13,12 +13,16 @@ package main
 import (
 	"Lab1_MapReduce/mr"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"plugin"
 )
 
 func main() {
+	if false {
+		log.SetOutput(io.Discard)
+	}
 	if len(os.Args) != 2 {
 		fmt.Fprintf(os.Stderr, "Usage: mrworker xxx.so\n")
 		os.Exit(1)

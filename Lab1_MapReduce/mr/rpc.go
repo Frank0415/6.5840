@@ -51,7 +51,7 @@ type GetWorkReply struct {
 }
 
 type FinishWorkArgs struct {
-	outPath  []string
+	OutPath  []string
 	WorkerId int
 	WorkId   int
 	Status   int // 1 -> Map Work, 2 -> Reduce Work
@@ -59,6 +59,14 @@ type FinishWorkArgs struct {
 }
 
 type FinishWorkReply struct {
+	Ack bool
+}
+
+type CheckHealthArgs struct {
+	WorkerId int
+}
+
+type CheckHealthReply struct {
 	Ack bool
 }
 
