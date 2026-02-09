@@ -1,0 +1,23 @@
+# ignore all
+*
+
+!.gitignore
+
+!Apps
+!Data
+!MapReduce
+!mr
+
+!Apps/*
+!Apps/*/*.go
+
+!Data/*.txt
+
+!MapReduce/*
+!MapReduce/*/*.go
+
+!mr/*.go
+
+!test-mr.sh
+!test-mr-many.sh
+!*.go
