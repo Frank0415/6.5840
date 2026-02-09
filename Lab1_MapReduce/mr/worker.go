@@ -77,7 +77,9 @@ func Worker(mapf func(string, string) []KeyValue,
 		status.currWork.WorkId = reply.WorkId
 		status.currWork.ReduceBucket = reply.ReduceBucket
 		status.currWork.inPath = reply.Path
+		status.signalMu.Lock()
 		status.currWork.StartTime = currTime
+		status.signalMu.Unlock()
 
 		switch status.workStatus {
 		case 0:
@@ -144,12 +146,14 @@ func (w *workerStat) CallFinishWork(workType int) {
 func CallCheckHealth(WId int, WorkTime *time.Time, signalKill *bool, mutex *sync.Mutex) {
 	for {
 		time.Sleep(1 * time.Second)
+		mutex.Lock()
 		args := CheckHealthArgs{WorkerId: WId, WorkMsec: time.Since(*WorkTime).Milliseconds()}
+		mutex.Unlock()
 		reply := CheckHealthReply{}
 
 		mutex.Lock()
 		ok := call("Coordinator.CheckHealth", &args, &reply)
-		signalKill = &reply.Ack
+		*signalKill = reply.Ack
 		mutex.Unlock()
 
 		if ok {
@@ -347,6 +351,8 @@ func (w *workerStat) reduceFunc(reducef func(string, []string) string) {
 		log.Fatalf("cannot rename %v to %v: %v", tempFile.Name(), oname, err)
 	}
 
+	w.CallFinishWork(2)
+
 	// Cleanup intermediate files
 	for i := 0; i < w.totalMap; i++ {
 		filename := fmt.Sprintf("mr-%d-%d", i, w.currWork.ReduceBucket)
@@ -355,6 +361,4 @@ func (w *workerStat) reduceFunc(reducef func(string, []string) string) {
 			log.Printf("Warning: Failed to delete intermediate file %s: %v", filename, err)
 		}
 	}
-
-	w.CallFinishWork(2)
 }

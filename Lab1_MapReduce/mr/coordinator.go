@@ -84,6 +84,11 @@ func (c *Coordinator) GetWork(args *GetWorkArgs, reply *GetWorkReply) error {
 		}
 	}
 
+	if c.nCompletedMap < len(c.mTasks) {
+		reply.WorkType = 0
+		return nil
+	}
+
 	// 3. Check for available Slow Reduce Tasks
 	for i := range c.slowRTasks {
 		if c.slowRTasks[i].Status == 0 {
@@ -201,7 +206,7 @@ func (c *Coordinator) CheckHealth(args *CheckHealthArgs, reply *CheckHealthReply
 	reply.Ack = true
 
 	// We consider as a slow task
-	for args.WorkMsec > 5000 {
+	if args.WorkMsec > 5000 {
 		log.Printf("Worker %v is considered slow (WorkMsec %v)\n", args.WorkerId, args.WorkMsec)
 		// Mark any in-progress tasks assigned to this worker as slow
 		for i := range c.mTasks {
