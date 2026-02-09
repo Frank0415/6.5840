@@ -64,6 +64,7 @@ type FinishWorkReply struct {
 
 type CheckHealthArgs struct {
 	WorkerId int
+	WorkMsec int64
 }
 
 type CheckHealthReply struct {

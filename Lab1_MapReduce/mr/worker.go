@@ -8,6 +8,7 @@ import (
 	"net/rpc"
 	"os"
 	"sort"
+	"sync"
 	"time"
 )
 
@@ -26,6 +27,7 @@ func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
 func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
 
 type currentWork struct {
+	StartTime    time.Time
 	inPath       string
 	outPath      []string
 	WorkId       int
@@ -39,6 +41,8 @@ type workerStat struct {
 	totalMap    int
 	totalReduce int
 	currWork    currentWork
+	signalMu    sync.Mutex // Whether the signal to finish work, to prevent race conditions between main loop and heartbeat goroutine
+	killSignal  bool       // Whether the worker should kill itself, set by heartbeat goroutine when it detects the worker is too slow, or other work has been finished
 }
 
 // use ihash(key) % NReduce to choose the reduce
@@ -58,9 +62,10 @@ func Worker(mapf func(string, string) []KeyValue,
 		log.Fatalf("Failed to initialize worker: %v", err)
 	}
 
-	go CallCheckHealth(status.workerId)
+	go CallCheckHealth(status.workerId, &status.currWork.StartTime, &status.killSignal, &status.signalMu)
 
 	for {
+		currTime := time.Now()
 		reply, err := CallGetWork(status.workerId)
 		if err != nil {
 			log.Fatalf("Failed to get work: %v", err)
@@ -72,6 +77,7 @@ func Worker(mapf func(string, string) []KeyValue,
 		status.currWork.WorkId = reply.WorkId
 		status.currWork.ReduceBucket = reply.ReduceBucket
 		status.currWork.inPath = reply.Path
+		status.currWork.StartTime = currTime
 
 		switch status.workStatus {
 		case 0:
@@ -135,17 +141,21 @@ func (w *workerStat) CallFinishWork(workType int) {
 	call("Coordinator.FinishWork", &args, &reply)
 }
 
-func CallCheckHealth(WId int) {
+func CallCheckHealth(WId int, WorkTime *time.Time, signalKill *bool, mutex *sync.Mutex) {
 	for {
 		time.Sleep(1 * time.Second)
-		args := CheckHealthArgs{WorkerId: WId}
+		args := CheckHealthArgs{WorkerId: WId, WorkMsec: time.Since(*WorkTime).Milliseconds()}
 		reply := CheckHealthReply{}
 
+		mutex.Lock()
 		ok := call("Coordinator.CheckHealth", &args, &reply)
+		signalKill = &reply.Ack
+		mutex.Unlock()
+
 		if ok {
-			log.Printf("Worker %v heartbeat sent\n", WId)
+			log.Printf("Worker %v health check: WorkMsec %v\n", WId, args.WorkMsec)
 		} else {
-			log.Printf("Worker %v heartbeat failed!\n", WId)
+			log.Printf("Worker %v failed health check\n", WId)
 		}
 	}
 }
@@ -211,6 +221,17 @@ func (w *workerStat) mapFunc(mapf func(string, string) []KeyValue) {
 
 	kva := mapf(w.currWork.inPath, string(content))
 
+	// Group KeyValues by bucket and sort each bucket
+	bucketedKva := make([][]KeyValue, w.totalReduce)
+	for _, kv := range kva {
+		bucket := ihash(kv.Key) % w.totalReduce
+		bucketedKva[bucket] = append(bucketedKva[bucket], kv)
+	}
+
+	for i := 0; i < w.totalReduce; i++ {
+		sort.Sort(ByKey(bucketedKva[i]))
+	}
+
 	// Create temp files for intermediate output
 	tempFiles := []*os.File{}
 	tempFileNames := []string{}
@@ -223,11 +244,14 @@ func (w *workerStat) mapFunc(mapf func(string, string) []KeyValue) {
 		tempFileNames = append(tempFileNames, tempFile.Name())
 	}
 
-	for _, kv := range kva {
-		bucket := ihash(kv.Key) % w.totalReduce
-		fmt.Fprintf(tempFiles[bucket], "%v %v\n", kv.Key, kv.Value)
+	for i := 0; i < w.totalReduce; i++ {
+		for _, kv := range bucketedKva[i] {
+			fmt.Fprintf(tempFiles[i], "%v %v\n", kv.Key, kv.Value)
+		}
 	}
 
+	w.signalMu.Lock()
+	defer w.signalMu.Unlock()
 	for i, f := range tempFiles {
 		f.Close()
 		finalName := fmt.Sprintf("mr-%d-%d", w.currWork.WorkId, i)
@@ -236,12 +260,11 @@ func (w *workerStat) mapFunc(mapf func(string, string) []KeyValue) {
 			log.Fatalf("cannot rename %v to %v: %v", tempFileNames[i], finalName, err)
 		}
 	}
-
 	w.CallFinishWork(1)
 }
 
 func (w *workerStat) reduceFunc(reducef func(string, []string) string) {
-	intermediate := []KeyValue{}
+	intermediate := make([][]KeyValue, w.totalMap)
 	var ReadCount []bool
 	var ReadDone int
 	for range w.totalMap {
@@ -257,7 +280,6 @@ func (w *workerStat) reduceFunc(reducef func(string, []string) string) {
 			file, err := os.Open(filename)
 			if err != nil {
 				continue // Some maps might have failed or files missing?
-				// In a real system we'd check if this is an error we can recover from.
 			}
 
 			// Reading formatted output back
@@ -267,11 +289,12 @@ func (w *workerStat) reduceFunc(reducef func(string, []string) string) {
 				if n < 2 || err != nil {
 					break
 				}
-				intermediate = append(intermediate, kv)
+				intermediate[i] = append(intermediate[i], kv)
 			}
 			ReadCount[i] = true
 			ReadDone++
 			file.Close()
+			sort.Sort(ByKey(intermediate[i]))
 		}
 		if ReadDone == w.totalMap {
 			break
@@ -280,35 +303,57 @@ func (w *workerStat) reduceFunc(reducef func(string, []string) string) {
 		}
 	}
 
-	sort.Sort(ByKey(intermediate))
-
 	oname := fmt.Sprintf("mr-out-%d", w.currWork.ReduceBucket)
 	tempFile, err := os.CreateTemp(".", "mr-reduce-tmp-*")
 	if err != nil {
 		log.Fatalf("cannot create temp file")
 	}
 
-	i := 0
-	for i < len(intermediate) {
-		j := i + 1
-		for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
-			j++
+	// K-way merge implementation
+	pointers := make([]int, w.totalMap)
+	for {
+		// Find the smallest key among current elements in all buckets
+		var minKey string
+		found := false
+		for i := 0; i < w.totalMap; i++ {
+			if pointers[i] < len(intermediate[i]) {
+				if !found || intermediate[i][pointers[i]].Key < minKey {
+					minKey = intermediate[i][pointers[i]].Key
+					found = true
+				}
+			}
 		}
+
+		if !found {
+			break
+		}
+
+		// Collect all values for minKey across all buckets
 		values := []string{}
-		for k := i; k < j; k++ {
-			values = append(values, intermediate[k].Value)
+		for i := 0; i < w.totalMap; i++ {
+			for pointers[i] < len(intermediate[i]) && intermediate[i][pointers[i]].Key == minKey {
+				values = append(values, intermediate[i][pointers[i]].Value)
+				pointers[i]++
+			}
 		}
-		output := reducef(intermediate[i].Key, values)
 
-		fmt.Fprintf(tempFile, "%v %v\n", intermediate[i].Key, output)
-
-		i = j
+		output := reducef(minKey, values)
+		fmt.Fprintf(tempFile, "%v %v\n", minKey, output)
 	}
 
 	tempFile.Close()
 	err = os.Rename(tempFile.Name(), oname)
 	if err != nil {
 		log.Fatalf("cannot rename %v to %v: %v", tempFile.Name(), oname, err)
+	}
+
+	// Cleanup intermediate files
+	for i := 0; i < w.totalMap; i++ {
+		filename := fmt.Sprintf("mr-%d-%d", i, w.currWork.ReduceBucket)
+		err := os.Remove(filename)
+		if err != nil && !os.IsNotExist(err) {
+			log.Printf("Warning: Failed to delete intermediate file %s: %v", filename, err)
+		}
 	}
 
 	w.CallFinishWork(2)
