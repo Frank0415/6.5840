@@ -96,14 +96,23 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 // if it's ever committed. the second return value is the current
 // term. the third return value is true if this server believes it is
 // the leader.
-func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
+func (rf *Raft) Start(command any) (int, int, bool) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
-	// Your code here (3B).
-
-	return index, term, isLeader
+	if rf.CurrentState != Leader {
+		return -1, rf.PersistState.CurrentTerm, false
+	}
+	
+	index := rf.PersistState.Log[len(rf.PersistState.Log)-1].Index + 1
+	rf.PersistState.Log = append(rf.PersistState.Log, LogEntry{
+		Term:    rf.PersistState.CurrentTerm,
+		Index:   index,
+		Command: command,
+	})
+	rf.persist()
+	go rf.broadcastAppendEntries()
+	return index, rf.PersistState.CurrentTerm, true
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -138,15 +147,40 @@ func (rf *Raft) sendHeartbeatsTicker() {
 		time.Sleep(110 * time.Millisecond)
 		rf.mu.Lock()
 		if rf.CurrentState == Leader {
-			args := AppendEntriesArgs{
-				Term:     rf.PersistState.CurrentTerm,
-				LeaderId: rf.me,
+			if rf.VolatileLeaderState.SentIndirectHeartbeat {
+				rf.VolatileLeaderState.SentIndirectHeartbeat = false
+				rf.mu.Unlock()
+			} else {
+				rf.mu.Unlock()
+				rf.broadcastAppendEntries()
 			}
-			rf.mu.Unlock()
-			rf.sendAll(&args)
 		} else {
 			rf.mu.Unlock()
 		}
+	}
+}
+
+func (rf *Raft) applier() {
+	for rf.killed() == false {
+		var msgs []ApplyMsg
+
+		rf.mu.Lock()
+		for rf.VolatileState.LastApplied < rf.VolatileState.CommitIndex {
+			rf.VolatileState.LastApplied++
+			i := rf.VolatileState.LastApplied
+			cmd := rf.PersistState.Log[i].Command
+			msgs = append(msgs, ApplyMsg{
+				CommandValid: true,
+				Command:      cmd,
+				CommandIndex: i,
+			})
+		}
+		rf.mu.Unlock()
+
+		for _, m := range msgs {
+			rf.applyCh <- m
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
@@ -165,12 +199,15 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
+	rf.applyCh = applyCh
 
 	// Your initialization code here (3A, 3B, 3C).
 	rf.PersistState.Log = []LogEntry{{Term: 0, Index: 0}}
 	rf.CurrentState = Follower
 	rf.PersistState.CurrentTerm = 0
 	rf.PersistState.VotedFor = -1
+	rf.VolatileState.CommitIndex = 0
+	rf.VolatileState.LastApplied = 0
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
@@ -178,6 +215,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// start ticker goroutine to start elections
 	go rf.electionTicker()
 	go rf.sendHeartbeatsTicker()
+	go rf.applier()
 
 	return rf
 }

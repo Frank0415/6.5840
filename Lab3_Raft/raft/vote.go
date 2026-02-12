@@ -108,10 +108,6 @@ func (rf *Raft) voteProcess() {
 		}(i)
 	}
 
-	rf.mu.Lock()
-	rf.PersistState.VotedFor = me
-	rf.mu.Unlock()
-
 	totalVotes := 1
 	for {
 		vote := <-ch
@@ -131,11 +127,14 @@ func (rf *Raft) voteProcess() {
 
 		if totalVotes > len(rf.peers)/2 {
 			rf.CurrentState = Leader
+			rf.VolatileLeaderState.NextIndex = make([]int, len(rf.peers))
+			for i := range rf.peers {
+				rf.VolatileLeaderState.NextIndex[i] = rf.PersistState.Log[len(rf.PersistState.Log)-1].Index + 1
+			}
+			rf.VolatileLeaderState.MatchIndex = make([]int, len(rf.peers))
 			rf.mu.Unlock()
-			go rf.sendAll(&AppendEntriesArgs{
-				Term:     rf.PersistState.CurrentTerm,
-				LeaderId: rf.me,
-			})
+			// go rf.broadcastNoOp() // send initial heartbeat
+			go rf.broadcastAppendEntries() // send initial heartbeat
 			return
 		}
 		rf.mu.Unlock()

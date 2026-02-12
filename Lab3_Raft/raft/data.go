@@ -31,8 +31,9 @@ type Volatile struct {
 }
 
 type VolatileLeader struct {
-	NextIndex  []int
-	MatchIndex []int
+	NextIndex             []int
+	MatchIndex            []int
+	SentIndirectHeartbeat bool
 }
 
 // as each Raft peer becomes aware that successive log entries are
@@ -67,6 +68,8 @@ type Raft struct {
 	// Your data here (3A, 3B, 3C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
+	applyCh chan ApplyMsg
+
 	CurrentState State
 	hasHeartBeat bool
 
@@ -95,11 +98,18 @@ type RequestVoteReply struct {
 }
 
 type AppendEntriesArgs struct {
-	Term     int
-	LeaderId int
+	Term         int
+	LeaderId     int
+	PrevLogIndex int
+	PrevLogTerm  int
+	Entries      []LogEntry
+	LeaderCommit int
 }
 
 type AppendEntriesReply struct {
 	Term    int
 	Success bool
+	// If the conflict occurs we immediately clean up an entire term and expects the leader to send data to us again
+	ConfilctIdx int
+	ConflictTerm int
 }
