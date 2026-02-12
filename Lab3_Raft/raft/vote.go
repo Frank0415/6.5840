@@ -34,13 +34,37 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
-	if args.LastLogTerm < rf.PersistState.CurrentTerm || args.Term < rf.PersistState.CurrentTerm || args.LastLogIndex < rf.PersistState.Log[len(rf.PersistState.Log)-1].Index {
-		reply.VoteGranted = false
-		reply.Term = rf.PersistState.CurrentTerm
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	lastLog := rf.PersistState.Log[len(rf.PersistState.Log)-1]
+	reply.Term = rf.PersistState.CurrentTerm
+	reply.VoteGranted = false
+
+	// 1. Reply false if term < currentTerm
+	if args.Term < rf.PersistState.CurrentTerm {
 		return
 	}
-	reply.VoteGranted = true
-	reply.Term = rf.PersistState.CurrentTerm
+
+	// If term is greater, update currentTerm and reset votedFor
+	if args.Term > rf.PersistState.CurrentTerm {
+		rf.PersistState.CurrentTerm = args.Term
+		rf.PersistState.VotedFor = -1
+		rf.CurrentState = Follower
+		reply.Term = rf.PersistState.CurrentTerm
+	}
+
+	// 2. If votedFor is null or candidateId, and candidate's log is at least
+	// as up-to-date as receiver's log, grant vote
+	upToDate := (args.LastLogTerm > lastLog.Term) ||
+		(args.LastLogTerm == lastLog.Term && args.LastLogIndex >= lastLog.Index)
+
+	if (rf.PersistState.VotedFor == -1 || rf.PersistState.VotedFor == args.CandidateId) && upToDate {
+		rf.PersistState.VotedFor = args.CandidateId
+		rf.CurrentState = Follower
+		rf.hasHeartBeat = true // reset election timer
+		reply.VoteGranted = true
+	}
 }
 
 // The exact voting logic
@@ -54,18 +78,19 @@ func (rf *Raft) voteProcess() {
 	// Transition to Candidate and increment term
 	rf.CurrentState = Candidate
 	rf.PersistState.CurrentTerm++
-	rf.hasHeartBeat = false
-	rf.PersistState.HasVoted = false
+	rf.PersistState.VotedFor = rf.me
+	rf.hasHeartBeat = false // reset election timer for self
 
 	electionTerm := rf.PersistState.CurrentTerm
 	me := rf.me
-	lastPos := len(rf.PersistState.Log) - 1
+	lastLog := rf.PersistState.Log[len(rf.PersistState.Log)-1]
 	reqArgs := RequestVoteArgs{
 		Term:         electionTerm,
 		CandidateId:  me,
-		LastLogIndex: rf.PersistState.Log[lastPos].Index,
-		LastLogTerm:  rf.PersistState.Log[lastPos].Term,
+		LastLogIndex: lastLog.Index,
+		LastLogTerm:  lastLog.Term,
 	}
+
 	rf.mu.Unlock()
 
 	ch := make(chan bool, len(rf.peers))
@@ -84,7 +109,6 @@ func (rf *Raft) voteProcess() {
 	}
 
 	rf.mu.Lock()
-	rf.PersistState.HasVoted = true
 	rf.PersistState.VotedFor = me
 	rf.mu.Unlock()
 
