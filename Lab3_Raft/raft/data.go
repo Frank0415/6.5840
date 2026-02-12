@@ -21,7 +21,6 @@ type LogEntry struct {
 
 type Persist struct {
 	CurrentTerm int
-	HasVoted    bool
 	VotedFor    int
 	Log         []LogEntry
 }

@@ -125,11 +125,28 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
-func (rf *Raft) ticker() {
+func (rf *Raft) electionTicker() {
 	for rf.killed() == false {
-		ms := 50 + (rand.Int63() % 300)
+		ms := 250 + (rand.Int63() % 250)
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 		go rf.voteProcess()
+	}
+}
+
+func (rf *Raft) sendHeartbeatsTicker() {
+	for rf.killed() == false {
+		time.Sleep(110 * time.Millisecond)
+		rf.mu.Lock()
+		if rf.CurrentState == Leader {
+			args := AppendEntriesArgs{
+				Term:     rf.PersistState.CurrentTerm,
+				LeaderId: rf.me,
+			}
+			rf.mu.Unlock()
+			rf.sendAll(&args)
+		} else {
+			rf.mu.Unlock()
+		}
 	}
 }
 
@@ -150,12 +167,17 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (3A, 3B, 3C).
+	rf.PersistState.Log = []LogEntry{{Term: 0, Index: 0}}
+	rf.CurrentState = Follower
+	rf.PersistState.CurrentTerm = 0
+	rf.PersistState.VotedFor = -1
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
 	// start ticker goroutine to start elections
-	go rf.ticker()
+	go rf.electionTicker()
+	go rf.sendHeartbeatsTicker()
 
 	return rf
 }

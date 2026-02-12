@@ -21,7 +21,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Term = rf.PersistState.CurrentTerm
 		reply.Success = false
 		return
-	} else {
+	} else {	
 		rf.CurrentState = Follower
 		rf.hasHeartBeat = true
 		reply.Term = rf.PersistState.CurrentTerm
