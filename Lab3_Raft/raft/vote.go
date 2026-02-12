@@ -1,6 +1,5 @@
 package raft
 
-
 // example code to send a RequestVote RPC to a server.
 // server is the index of the target server in rf.peers[].
 // expects RPC arguments in args.
@@ -44,7 +43,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	reply.Term = rf.PersistState.CurrentTerm
 }
 
-
 // The exact voting logic
 func (rf *Raft) voteProcess() {
 	rf.mu.Lock()
@@ -53,72 +51,74 @@ func (rf *Raft) voteProcess() {
 		rf.mu.Unlock()
 		return
 	}
-    // Transition to Candidate and increment term
-    rf.CurrentState = Candidate
-    rf.PersistState.CurrentTerm++
-    rf.hasHeartBeat = false
-    
-    electionTerm := rf.PersistState.CurrentTerm
-    me := rf.me
-    lastPos := len(rf.PersistState.Log) - 1
-    reqArgs := RequestVoteArgs{
-        Term:         electionTerm,
-        CandidateId:  me,
-        LastLogIndex: rf.PersistState.Log[lastPos].Index,
-        LastLogTerm:  rf.PersistState.Log[lastPos].Term,
-    }
-    rf.mu.Unlock()
+	// Transition to Candidate and increment term
+	rf.CurrentState = Candidate
+	rf.PersistState.CurrentTerm++
+	rf.hasHeartBeat = false
+	rf.PersistState.HasVoted = false
 
-    ch := make(chan bool, len(rf.peers))
-    for i := range rf.peers {
-        if i == me {
-            continue
-        }
-        go func(peer int) {
-            reply := RequestVoteReply{}
-            if ok := rf.sendRequestVote(peer, &reqArgs, &reply); ok {
-                ch <- reply.VoteGranted
-            } else {
-                ch <- false
-            }
-        }(i)
-    }
+	electionTerm := rf.PersistState.CurrentTerm
+	me := rf.me
+	lastPos := len(rf.PersistState.Log) - 1
+	reqArgs := RequestVoteArgs{
+		Term:         electionTerm,
+		CandidateId:  me,
+		LastLogIndex: rf.PersistState.Log[lastPos].Index,
+		LastLogTerm:  rf.PersistState.Log[lastPos].Term,
+	}
+	rf.mu.Unlock()
 
-    totalVotes := 1
-    for {
-        vote := <-ch
-        
-        rf.mu.Lock()
-        // Termination logic: 
-        // 1. Term changed (new election started)
-        // 2. Role changed (received heartbeat or already won)
-        if rf.PersistState.CurrentTerm != electionTerm || rf.CurrentState != Candidate {
-            rf.mu.Unlock()
-            return
-        }
-
-        if vote {
-            totalVotes++
-        }
-
-        if totalVotes > len(rf.peers)/2 {
-            rf.CurrentState = Leader
-            // TODO: Trigger immediate heartbeats here
-			for i := range rf.peers {
-				if i == me {
-					continue
-				} else{
-					
-				}
+	ch := make(chan bool, len(rf.peers))
+	for i := range rf.peers {
+		if i == me {
+			continue
+		}
+		go func(peer int) {
+			reply := RequestVoteReply{}
+			if ok := rf.sendRequestVote(peer, &reqArgs, &reply); ok {
+				ch <- reply.VoteGranted
+			} else {
+				ch <- false
 			}
-            rf.mu.Unlock()
-            return
-        }
-        rf.mu.Unlock()
-        
-        // Break if all weight/replies accounted for
-        if totalVotes + (len(rf.peers) - 1 - totalVotes) <= len(rf.peers)/2 {
-            return
-        }
-    }
+		}(i)
+	}
+
+	rf.mu.Lock()
+	rf.PersistState.HasVoted = true
+	rf.PersistState.VotedFor = me
+	rf.mu.Unlock()
+
+	totalVotes := 1
+	for {
+		vote := <-ch
+
+		rf.mu.Lock()
+		// Termination logic:
+		// 1. Term changed (new election started)
+		// 2. Role changed (received heartbeat or already won)
+		if rf.PersistState.CurrentTerm != electionTerm || rf.CurrentState != Candidate {
+			rf.mu.Unlock()
+			return
+		}
+
+		if vote {
+			totalVotes++
+		}
+
+		if totalVotes > len(rf.peers)/2 {
+			rf.CurrentState = Leader
+			rf.mu.Unlock()
+			go rf.sendAll(&AppendEntriesArgs{
+				Term:     rf.PersistState.CurrentTerm,
+				LeaderId: rf.me,
+			})
+			return
+		}
+		rf.mu.Unlock()
+
+		// Break if all weight/replies accounted for
+		if totalVotes+(len(rf.peers)-1-totalVotes) <= len(rf.peers)/2 {
+			return
+		}
+	}
 }

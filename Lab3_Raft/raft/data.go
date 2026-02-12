@@ -21,6 +21,7 @@ type LogEntry struct {
 
 type Persist struct {
 	CurrentTerm int
+	HasVoted    bool
 	VotedFor    int
 	Log         []LogEntry
 }
@@ -95,11 +96,11 @@ type RequestVoteReply struct {
 }
 
 type AppendEntriesArgs struct {
-	term     int
-	leaderId int
+	Term     int
+	LeaderId int
 }
 
 type AppendEntriesReply struct {
-	term    int
-	success bool
+	Term    int
+	Success bool
 }
