@@ -9,65 +9,69 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-    rf.mu.Lock()
-    defer rf.mu.Unlock()
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
-    reply.Success = false
-    reply.Term = rf.PersistState.CurrentTerm
-    reply.ConflictTerm = -1
-    reply.ConfilctIdx = -1 // keep your current field name if already used elsewhere
+	reply.Success = false
+	reply.Term = rf.PersistState.CurrentTerm
+	reply.ConflictTerm = -1
+	reply.ConflictIdx = -1 // keep your current field name if already used elsewhere
 
-    if args.Term < rf.PersistState.CurrentTerm {
-        return
-    }
+	if args.Term < rf.PersistState.CurrentTerm {
+		return
+	}
 
-    if args.Term > rf.PersistState.CurrentTerm {
-        rf.PersistState.CurrentTerm = args.Term
-        rf.PersistState.VotedFor = -1
-    }
-    rf.CurrentState = Follower
-    rf.hasHeartBeat = true
-    reply.Term = rf.PersistState.CurrentTerm
+	if args.Term > rf.PersistState.CurrentTerm {
+		rf.PersistState.CurrentTerm = args.Term
+		rf.PersistState.VotedFor = -1
+		rf.persist()
+	}
+	rf.CurrentState = Follower
+	rf.hasHeartBeat = true
+	reply.Term = rf.PersistState.CurrentTerm
 
-    // 1) missing prevLogIndex
-    if args.PrevLogIndex >= len(rf.PersistState.Log) {
-        reply.ConfilctIdx = rf.PersistState.Log[len(rf.PersistState.Log)-1].Index + 1
-        return
-    }
+	// 1) missing prevLogIndex
+	if args.PrevLogIndex >= len(rf.PersistState.Log) {
+		reply.ConflictIdx = rf.PersistState.Log[len(rf.PersistState.Log)-1].Index + 1
+		return
+	}
 
-    // 2) term mismatch at prevLogIndex
-    if rf.PersistState.Log[args.PrevLogIndex].Term != args.PrevLogTerm {
-        ct := rf.PersistState.Log[args.PrevLogIndex].Term
-        reply.ConflictTerm = ct
-        i := args.PrevLogIndex
-        for i > 0 && rf.PersistState.Log[i-1].Term == ct {
-            i--
-        }
-        reply.ConfilctIdx = i
-        return
-    }
+	// 2) term mismatch at prevLogIndex
+	if rf.PersistState.Log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		ct := rf.PersistState.Log[args.PrevLogIndex].Term
+		reply.ConflictTerm = ct
+		i := args.PrevLogIndex
+		for i > 0 && rf.PersistState.Log[i-1].Term == ct {
+			i--
+		}
+		reply.ConflictIdx = i
+		return
+	}
 
-    // 3) prefix matches; now merge
-    for i := 0; i < len(args.Entries); i++ {
-        pos := args.PrevLogIndex + 1 + i
-        if pos < len(rf.PersistState.Log) {
-            if rf.PersistState.Log[pos].Term != args.Entries[i].Term {
-                rf.PersistState.Log = append(rf.PersistState.Log[:pos], args.Entries[i:]...)
-                break
-            }
-        } else {
-            rf.PersistState.Log = append(rf.PersistState.Log, args.Entries[i:]...)
-            break
-        }
-    }
+	// 3) prefix matches; now merge
+	for i := 0; i < len(args.Entries); i++ {
+		pos := args.PrevLogIndex + 1 + i
+		if pos < len(rf.PersistState.Log) {
+			if rf.PersistState.Log[pos].Term != args.Entries[i].Term {
+				rf.PersistState.Log = append(rf.PersistState.Log[:pos], args.Entries[i:]...)
+				rf.persist()
+				break
+			}
+		} else {
+			rf.PersistState.Log = append(rf.PersistState.Log, args.Entries[i:]...)
+			rf.persist()
+			break
+		}
+	}
 
-    if args.LeaderCommit > rf.VolatileState.CommitIndex {
-        last := len(rf.PersistState.Log) - 1
-        rf.VolatileState.CommitIndex = min(args.LeaderCommit, last)
-    }
+	if args.LeaderCommit > rf.VolatileState.CommitIndex {
+		last := len(rf.PersistState.Log) - 1
+		rf.VolatileState.CommitIndex = min(args.LeaderCommit, last)
+	}
 
-    reply.Success = true
+	reply.Success = true
 }
+
 /*
 For a leader to send appendEntries RPC, we need to:
 1. Get the current term and log info (PrevLogIndex, PrevLogTerm, Entries, LeaderCommit), should be the last one if no error.
@@ -112,6 +116,7 @@ func (rf *Raft) replicateToPeer(peer int) {
 			rf.PersistState.CurrentTerm = reply.Term
 			rf.PersistState.VotedFor = -1
 			rf.CurrentState = Follower
+			rf.persist()
 			return
 		}
 
@@ -124,7 +129,7 @@ func (rf *Raft) replicateToPeer(peer int) {
 			rf.VolatileLeaderState.NextIndex[peer] = rf.VolatileLeaderState.MatchIndex[peer] + 1
 			rf.updateCommitIndex()
 		} else {
-			rf.VolatileLeaderState.NextIndex[peer] = max(reply.ConfilctIdx, 1)
+			rf.VolatileLeaderState.NextIndex[peer] = max(reply.ConflictIdx, 1)
 			go rf.replicateToPeer(peer)
 		}
 	}
@@ -157,16 +162,17 @@ func (rf *Raft) broadcastAppendEntries() {
 	rf.VolatileLeaderState.SentIndirectHeartbeat = true
 }
 
-func (rf *Raft) broadcastNoOp() {
-	rf.mu.Lock()
-	if rf.CurrentState != Leader {
-		rf.mu.Unlock()
-		return
-	}
-	rf.PersistState.Log = append(rf.PersistState.Log, LogEntry{
-		Term:  rf.PersistState.CurrentTerm,
-		Index: len(rf.PersistState.Log),
-	})
-	rf.mu.Unlock()
-	rf.broadcastAppendEntries()
-}
+// func (rf *Raft) broadcastNoOp() {
+// 	rf.mu.Lock()
+// 	if rf.CurrentState != Leader {
+// 		rf.mu.Unlock()
+// 		return
+// 	}
+// 	rf.PersistState.Log = append(rf.PersistState.Log, LogEntry{
+// 		Term:  rf.PersistState.CurrentTerm,
+// 		Index: len(rf.PersistState.Log),
+// 	})
+// 	rf.persist()
+// 	rf.mu.Unlock()
+// 	rf.broadcastAppendEntries()
+// }

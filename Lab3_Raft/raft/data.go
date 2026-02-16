@@ -110,6 +110,6 @@ type AppendEntriesReply struct {
 	Term    int
 	Success bool
 	// If the conflict occurs we immediately clean up an entire term and expects the leader to send data to us again
-	ConfilctIdx int
+	ConflictIdx  int
 	ConflictTerm int
 }

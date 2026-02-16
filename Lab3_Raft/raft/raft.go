@@ -18,12 +18,12 @@ package raft
 //
 
 import (
-	//	"bytes"
+	"bytes"
 	"math/rand"
 	"sync/atomic"
 	"time"
 
-	//	"Lab3_Raft/labgob"
+	"Lab3_Raft/labgob"
 	"Lab3_Raft/labrpc"
 )
 
@@ -45,14 +45,16 @@ func (rf *Raft) GetState() (int, bool) {
 // after you've implemented snapshots, pass the current snapshot
 // (or nil if there's not yet a snapshot).
 func (rf *Raft) persist() {
-	// Your code here (3C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// raftstate := w.Bytes()
-	// rf.persister.Save(raftstate, nil)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+
+	if e.Encode(rf.PersistState.CurrentTerm) != nil ||
+		e.Encode(rf.PersistState.VotedFor) != nil ||
+		e.Encode(rf.PersistState.Log) != nil {
+		return
+	}
+
+	rf.persister.Save(w.Bytes(), nil)
 }
 
 // restore previously persisted state.
@@ -60,19 +62,26 @@ func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
 	}
-	// Your code here (3C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+
+	var currentTerm int
+	var votedFor int
+	var log []LogEntry
+
+	if d.Decode(&currentTerm) != nil ||
+		d.Decode(&votedFor) != nil ||
+		d.Decode(&log) != nil {
+		return
+	}
+
+	rf.PersistState.CurrentTerm = currentTerm
+	rf.PersistState.VotedFor = votedFor
+	if len(log) == 0 {
+		rf.PersistState.Log = []LogEntry{{Term: 0, Index: 0}}
+	} else {
+		rf.PersistState.Log = log
+	}
 }
 
 // the service says it has created a snapshot that has
@@ -103,7 +112,7 @@ func (rf *Raft) Start(command any) (int, int, bool) {
 	if rf.CurrentState != Leader {
 		return -1, rf.PersistState.CurrentTerm, false
 	}
-	
+
 	index := rf.PersistState.Log[len(rf.PersistState.Log)-1].Index + 1
 	rf.PersistState.Log = append(rf.PersistState.Log, LogEntry{
 		Term:    rf.PersistState.CurrentTerm,
