@@ -37,6 +37,47 @@ func (rf *Raft) GetState() (int, bool) {
 	return term, isleader
 }
 
+func (rf *Raft) firstLogIndex() int {
+	return rf.PersistState.Log[0].Index
+}
+
+func (rf *Raft) lastLogIndex() int {
+	return rf.PersistState.Log[len(rf.PersistState.Log)-1].Index
+}
+
+func (rf *Raft) toLogOffset(index int) int {
+	return index - rf.firstLogIndex()
+}
+
+func (rf *Raft) logTermAt(index int) int {
+	offset := rf.toLogOffset(index)
+	if offset < 0 || offset >= len(rf.PersistState.Log) {
+		return -1
+	}
+	return rf.PersistState.Log[offset].Term
+}
+
+func (rf *Raft) logEntryAt(index int) LogEntry {
+	return rf.PersistState.Log[rf.toLogOffset(index)]
+}
+
+func (rf *Raft) encodePersistentState() ([]byte, bool) {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	if e.Encode(rf.PersistState.CurrentTerm) != nil ||
+		e.Encode(rf.PersistState.VotedFor) != nil ||
+		e.Encode(rf.PersistState.Log) != nil {
+		return nil, false
+	}
+	return w.Bytes(), true
+}
+
+func (rf *Raft) persistWithSnapshot(snapshot []byte) {
+	if raftState, ok := rf.encodePersistentState(); ok {
+		rf.persister.Save(raftState, snapshot)
+	}
+}
+
 // save Raft's persistent state to stable storage,
 // where it can later be retrieved after a crash and restart.
 // see paper's Figure 2 for a description of what should be persistent.
@@ -45,21 +86,12 @@ func (rf *Raft) GetState() (int, bool) {
 // after you've implemented snapshots, pass the current snapshot
 // (or nil if there's not yet a snapshot).
 func (rf *Raft) persist() {
-	w := new(bytes.Buffer)
-	e := labgob.NewEncoder(w)
-
-	if e.Encode(rf.PersistState.CurrentTerm) != nil ||
-		e.Encode(rf.PersistState.VotedFor) != nil ||
-		e.Encode(rf.PersistState.Log) != nil {
-		return
-	}
-
-	rf.persister.Save(w.Bytes(), nil)
+	rf.persistWithSnapshot(rf.persister.ReadSnapshot())
 }
 
 // restore previously persisted state.
 func (rf *Raft) readPersist(data []byte) {
-	if data == nil || len(data) < 1 { // bootstrap without any state?
+	if len(data) < 1 { // bootstrap without any state?
 		return
 	}
 	r := bytes.NewBuffer(data)
@@ -84,14 +116,7 @@ func (rf *Raft) readPersist(data []byte) {
 	}
 }
 
-// the service says it has created a snapshot that has
-// all info up to and including index. this means the
-// service no longer needs the log through (and including)
-// that index. Raft should now trim its log as much as possible.
-func (rf *Raft) Snapshot(index int, snapshot []byte) {
-	// Your code here (3D).
 
-}
 
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
@@ -113,7 +138,7 @@ func (rf *Raft) Start(command any) (int, int, bool) {
 		return -1, rf.PersistState.CurrentTerm, false
 	}
 
-	index := rf.PersistState.Log[len(rf.PersistState.Log)-1].Index + 1
+	index := rf.lastLogIndex() + 1
 	rf.PersistState.Log = append(rf.PersistState.Log, LogEntry{
 		Term:    rf.PersistState.CurrentTerm,
 		Index:   index,
@@ -177,7 +202,7 @@ func (rf *Raft) applier() {
 		for rf.VolatileState.LastApplied < rf.VolatileState.CommitIndex {
 			rf.VolatileState.LastApplied++
 			i := rf.VolatileState.LastApplied
-			cmd := rf.PersistState.Log[i].Command
+			cmd := rf.logEntryAt(i).Command
 			msgs = append(msgs, ApplyMsg{
 				CommandValid: true,
 				Command:      cmd,
@@ -220,6 +245,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+	rf.VolatileState.CommitIndex = rf.firstLogIndex()
+	rf.VolatileState.LastApplied = rf.firstLogIndex()
 
 	// start ticker goroutine to start elections
 	go rf.electionTicker()

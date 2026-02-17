@@ -51,6 +51,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.PersistState.CurrentTerm = args.Term
 		rf.PersistState.VotedFor = -1
 		rf.CurrentState = Follower
+		rf.persist()
 		reply.Term = rf.PersistState.CurrentTerm
 	}
 
@@ -63,6 +64,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.PersistState.VotedFor = args.CandidateId
 		rf.CurrentState = Follower
 		rf.hasHeartBeat = true // reset election timer
+		rf.persist()
 		reply.VoteGranted = true
 	}
 }
@@ -80,6 +82,7 @@ func (rf *Raft) voteProcess() {
 	rf.PersistState.CurrentTerm++
 	rf.PersistState.VotedFor = rf.me
 	rf.hasHeartBeat = false // reset election timer for self
+	rf.persist()
 
 	electionTerm := rf.PersistState.CurrentTerm
 	me := rf.me
