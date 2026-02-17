@@ -216,7 +216,9 @@ func (rf *Raft) broadcastAppendEntries() {
 			go rf.replicateToPeer(i)
 		}
 	}
+	rf.mu.Lock()
 	rf.VolatileLeaderState.SentIndirectHeartbeat = true
+	rf.mu.Unlock()
 }
 
 // func (rf *Raft) broadcastNoOp() {
