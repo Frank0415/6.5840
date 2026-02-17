@@ -113,3 +113,19 @@ type AppendEntriesReply struct {
 	ConflictIdx  int
 	ConflictTerm int
 }
+
+type InstallSnapshotArgs struct {
+	Term int
+	LeaderId int
+	
+	LastIncludedIndex int
+	LastIncludedTerm int
+
+	Offset int
+	Data []byte
+	Done bool
+}
+
+type InstallSnapshotReply struct {
+	Term int
+}

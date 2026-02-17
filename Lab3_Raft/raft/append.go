@@ -29,19 +29,26 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.CurrentState = Follower
 	rf.hasHeartBeat = true
 	reply.Term = rf.PersistState.CurrentTerm
+	firstLogIndex := rf.firstLogIndex()
+	lastLogIndex := rf.lastLogIndex()
+
+	if args.PrevLogIndex < firstLogIndex {
+		reply.ConflictIdx = firstLogIndex + 1
+		return
+	}
 
 	// 1) missing prevLogIndex
-	if args.PrevLogIndex >= len(rf.PersistState.Log) {
-		reply.ConflictIdx = rf.PersistState.Log[len(rf.PersistState.Log)-1].Index + 1
+	if args.PrevLogIndex > lastLogIndex {
+		reply.ConflictIdx = lastLogIndex + 1
 		return
 	}
 
 	// 2) term mismatch at prevLogIndex
-	if rf.PersistState.Log[args.PrevLogIndex].Term != args.PrevLogTerm {
-		ct := rf.PersistState.Log[args.PrevLogIndex].Term
+	if rf.logTermAt(args.PrevLogIndex) != args.PrevLogTerm {
+		ct := rf.logTermAt(args.PrevLogIndex)
 		reply.ConflictTerm = ct
 		i := args.PrevLogIndex
-		for i > 0 && rf.PersistState.Log[i-1].Term == ct {
+		for i > firstLogIndex && rf.logTermAt(i-1) == ct {
 			i--
 		}
 		reply.ConflictIdx = i
@@ -50,10 +57,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// 3) prefix matches; now merge
 	for i := 0; i < len(args.Entries); i++ {
-		pos := args.PrevLogIndex + 1 + i
-		if pos < len(rf.PersistState.Log) {
-			if rf.PersistState.Log[pos].Term != args.Entries[i].Term {
-				rf.PersistState.Log = append(rf.PersistState.Log[:pos], args.Entries[i:]...)
+		index := args.PrevLogIndex + 1 + i
+		if index <= rf.lastLogIndex() {
+			if rf.logTermAt(index) != args.Entries[i].Term {
+				offset := rf.toLogOffset(index)
+				rf.PersistState.Log = append(rf.PersistState.Log[:offset], args.Entries[i:]...)
 				rf.persist()
 				break
 			}
@@ -65,7 +73,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	if args.LeaderCommit > rf.VolatileState.CommitIndex {
-		last := len(rf.PersistState.Log) - 1
+		last := rf.lastLogIndex()
 		rf.VolatileState.CommitIndex = min(args.LeaderCommit, last)
 	}
 
@@ -92,16 +100,52 @@ func (rf *Raft) replicateToPeer(peer int) {
 		rf.mu.Unlock()
 		return
 	}
+	firstIndex := rf.firstLogIndex()
+	nextIndex := rf.VolatileLeaderState.NextIndex[peer]
+	if nextIndex <= firstIndex {
+		args := InstallSnapshotArgs{
+			Term:              rf.PersistState.CurrentTerm,
+			LeaderId:          rf.me,
+			LastIncludedIndex: firstIndex,
+			LastIncludedTerm:  rf.PersistState.Log[0].Term,
+			Offset:            0,
+			Data:              rf.persister.ReadSnapshot(),
+			Done:              true,
+		}
+		rf.mu.Unlock()
 
-	prevLogIndex := rf.VolatileLeaderState.NextIndex[peer] - 1
-	entries := make([]LogEntry, len(rf.PersistState.Log)-(prevLogIndex+1))
-	copy(entries, rf.PersistState.Log[prevLogIndex+1:])
+		reply := InstallSnapshotReply{}
+		if ok := rf.sendInstallSnapshot(peer, &args, &reply); ok {
+			rf.mu.Lock()
+			defer rf.mu.Unlock()
+
+			if reply.Term > rf.PersistState.CurrentTerm {
+				rf.PersistState.CurrentTerm = reply.Term
+				rf.PersistState.VotedFor = -1
+				rf.CurrentState = Follower
+				rf.persist()
+				return
+			}
+
+			if rf.CurrentState != Leader || rf.PersistState.CurrentTerm != args.Term {
+				return
+			}
+
+			rf.VolatileLeaderState.MatchIndex[peer] = max(rf.VolatileLeaderState.MatchIndex[peer], args.LastIncludedIndex)
+			rf.VolatileLeaderState.NextIndex[peer] = rf.VolatileLeaderState.MatchIndex[peer] + 1
+		}
+		return
+	}
+
+	prevLogIndex := nextIndex - 1
+	prevOffset := rf.toLogOffset(prevLogIndex)
+	entries := append([]LogEntry(nil), rf.PersistState.Log[prevOffset+1:]...)
 
 	args := AppendEntriesArgs{
 		Term:         rf.PersistState.CurrentTerm,
 		LeaderId:     rf.me,
 		PrevLogIndex: prevLogIndex,
-		PrevLogTerm:  rf.PersistState.Log[prevLogIndex].Term,
+		PrevLogTerm:  rf.PersistState.Log[prevOffset].Term,
 		Entries:      entries,
 		LeaderCommit: rf.VolatileState.CommitIndex,
 	}
@@ -129,15 +173,28 @@ func (rf *Raft) replicateToPeer(peer int) {
 			rf.VolatileLeaderState.NextIndex[peer] = rf.VolatileLeaderState.MatchIndex[peer] + 1
 			rf.updateCommitIndex()
 		} else {
-			rf.VolatileLeaderState.NextIndex[peer] = max(reply.ConflictIdx, 1)
+			next := reply.ConflictIdx
+			if reply.ConflictTerm != -1 {
+				leaderLastIdxForTerm := -1
+				for idx := rf.lastLogIndex(); idx >= rf.firstLogIndex(); idx-- {
+					if rf.logTermAt(idx) == reply.ConflictTerm {
+						leaderLastIdxForTerm = idx
+						break
+					}
+				}
+				if leaderLastIdxForTerm != -1 {
+					next = leaderLastIdxForTerm + 1
+				}
+			}
+			rf.VolatileLeaderState.NextIndex[peer] = max(next, 1)
 			go rf.replicateToPeer(peer)
 		}
 	}
 }
 
 func (rf *Raft) updateCommitIndex() {
-	for n := len(rf.PersistState.Log) - 1; n > rf.VolatileState.CommitIndex; n-- {
-		if rf.PersistState.Log[n].Term != rf.PersistState.CurrentTerm {
+	for n := rf.lastLogIndex(); n > rf.VolatileState.CommitIndex; n-- {
+		if rf.logTermAt(n) != rf.PersistState.CurrentTerm {
 			continue
 		}
 		count := 1
