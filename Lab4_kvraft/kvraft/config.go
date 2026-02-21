@@ -1,20 +1,22 @@
 package kvraft
 
-import "6.5840/labrpc"
-import "testing"
-import "os"
+import (
+	"Lab4_kvraft/labrpc"
+	"os"
+	"testing"
 
-// import "log"
-import crand "crypto/rand"
-import "math/big"
-import "math/rand"
-import "encoding/base64"
-import "sync"
-import "runtime"
-import "6.5840/raft"
-import "fmt"
-import "time"
-import "sync/atomic"
+	// import "log"
+	"Lab4_kvraft/raft"
+	crand "crypto/rand"
+	"encoding/base64"
+	"fmt"
+	"math/big"
+	"math/rand"
+	"runtime"
+	"sync"
+	"sync/atomic"
+	"time"
+)
 
 func randstring(n int) string {
 	b := make([]byte, 2*n)
