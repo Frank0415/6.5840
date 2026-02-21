@@ -4,6 +4,7 @@ import (
 	"Lab4_kvraft/labgob"
 	"Lab4_kvraft/labrpc"
 	"Lab4_kvraft/raft"
+	"bytes"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -38,11 +39,13 @@ type KVServer struct {
 	dead    int32 // set by Kill()
 
 	maxraftstate int // snapshot if log grows this big
+	persister    *raft.Persister
 
 	// Your definitions here.
 	data        map[string]string
 	lastApplied map[int64]int64
 	waitCh      map[int]chan Op
+	applyIndex  int
 }
 
 func (kv *KVServer) getWaitCh(index int) chan Op {
@@ -179,11 +182,14 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv := new(KVServer)
 	kv.me = me
 	kv.maxraftstate = maxraftstate
+	kv.persister = persister
 
 	// You may need initialization code here.
 	kv.data = make(map[string]string)
 	kv.lastApplied = make(map[int64]int64)
 	kv.waitCh = make(map[int]chan Op)
+
+	kv.readSnapshot(kv.persister.ReadSnapshot())
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
@@ -201,14 +207,19 @@ func (kv *KVServer) applier() {
 			op := msg.Command.(Op)
 			kv.mu.Lock()
 
+			kv.applyIndex = msg.CommandIndex
+
 			if op.Type != "Get" {
 				lastId, ok := kv.lastApplied[op.ClientId]
 				if !ok || op.OpId > lastId {
+					kv.applyIndex = msg.CommandIndex
 					switch op.Type {
 					case "Put":
 						kv.data[op.Key] = op.Value
 					case "Append":
 						kv.data[op.Key] += op.Value
+					default:
+						log.Fatalf("Unknown operation type: %s", op.Type)
 					}
 					kv.lastApplied[op.ClientId] = op.OpId
 				}
@@ -217,7 +228,44 @@ func (kv *KVServer) applier() {
 			if ch, ok := kv.waitCh[msg.CommandIndex]; ok {
 				ch <- op
 			}
+
+			if kv.maxraftstate != -1 && kv.persister.RaftStateSize() >= kv.maxraftstate*4/5 {
+				kv.MakeSnapshot()
+			}
+			kv.mu.Unlock()
+		} else if msg.SnapshotValid {
+			kv.mu.Lock()
+			kv.readSnapshot(msg.Snapshot)
 			kv.mu.Unlock()
 		}
+	}
+}
+
+func (kv *KVServer) MakeSnapshot() {
+	// DO NOT LOCK as it is called from applier which already holds the lock
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(kv.data)
+	e.Encode(kv.lastApplied)
+	e.Encode(kv.applyIndex)
+	data := w.Bytes()
+	kv.rf.Snapshot(kv.applyIndex, data)
+}
+
+func (kv *KVServer) readSnapshot(snapshot []byte) {
+	if snapshot == nil || len(snapshot) < 1 {
+		return
+	}
+	r := bytes.NewBuffer(snapshot)
+	d := labgob.NewDecoder(r)
+	var data map[string]string
+	var lastApplied map[int64]int64
+	var CommandIndex int
+	if d.Decode(&data) != nil || d.Decode(&lastApplied) != nil || d.Decode(&CommandIndex) != nil {
+		log.Fatalf("Failed to read snapshot")
+	} else {
+		kv.data = data
+		kv.lastApplied = lastApplied
+		kv.applyIndex = CommandIndex
 	}
 }
