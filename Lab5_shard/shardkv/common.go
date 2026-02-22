@@ -1,5 +1,7 @@
 package shardkv
 
+import "Lab5_shard/shardctrler"
+
 //
 // Sharded key/value server.
 // Lots of replica groups, each running Raft.
@@ -17,6 +19,18 @@ const (
 )
 
 type Err string
+
+// which shard is a key in?
+// please use this function,
+// and please do not change it.
+func key2shard(key string) int {
+	shard := 0
+	if len(key) > 0 {
+		shard = int(key[0])
+	}
+	shard %= shardctrler.NShards
+	return shard
+}
 
 // Put or Append
 type PutAppendArgs struct {
@@ -45,4 +59,24 @@ type GetArgs struct {
 type GetReply struct {
 	Err   Err
 	Value string
+}
+
+type FetchShardArgs struct {
+	ShardId   int
+	ConfigNum int
+}
+
+type FetchShardReply struct {
+	Err       Err
+	KV        map[string]string
+	ClientSeq map[int64]int64
+}
+
+type CheckShardArgs struct {
+	ShardId   int
+	ConfigNum int
+}
+
+type CheckShardReply struct {
+	Err Err
 }
