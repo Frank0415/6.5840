@@ -1,98 +1,326 @@
 package shardctrler
 
-
-import "Lab5_shard/raft"
-import "Lab5_shard/labrpc"
-import "sync"
-import "Lab5_shard/labgob"
-
+import (
+    "Lab5_shard/labgob"
+    "Lab5_shard/labrpc"
+    "Lab5_shard/raft"
+    "sort"
+    "sync"
+    "sync/atomic"
+    "time"
+)
 
 type ShardCtrler struct {
-	mu      sync.Mutex
-	me      int
-	rf      *raft.Raft
-	applyCh chan raft.ApplyMsg
+    mu      sync.Mutex
+    me      int
+    rf      *raft.Raft
+    applyCh chan raft.ApplyMsg
+    dead    atomic.Bool // set by Kill()
 
-	// Your data here.
-	configNum int
-	configs []Config // indexed by config num
+    configNum int
+    configs   []Config // indexed by config num
+    waitCh    map[int]chan Op
 }
 
+const (
+    Join  = "Join"
+    Leave = "Leave"
+    Move  = "Move"
+    Query = "Query"
+)
 
 type Op struct {
-	// Your data here.
+    Type    string
+    Servers map[int][]string // For Join
+    GIDs    []int            // For Leave
+    Shard   int              // For Move
+    GID     int              // For Move
+    Num     int              // For Query
+    ReqId   int64            // Unique ID to prevent index collisions
 }
 
+func (sc *ShardCtrler) createNextConfig() Config {
+    lastConfig := sc.configs[len(sc.configs)-1]
+    nextConfig := Config{
+        Num:    lastConfig.Num + 1,
+        Shards: lastConfig.Shards, // Arrays are copied by value
+        Groups: make(map[int][]string),
+    }
+
+    // Deep copy the groups map
+    for gid, servers := range lastConfig.Groups {
+        nextConfig.Groups[gid] = append([]string{}, servers...)
+    }
+
+    return nextConfig
+}
+
+func rebalance(config *Config) {
+    if len(config.Groups) == 0 {
+        for i := range len(config.Shards) {
+            config.Shards[i] = 0
+        }
+        return
+    }
+
+    // 1. Group shards by GID
+    gidToShards := make(map[int][]int)
+    var gids []int
+    for gid := range config.Groups {
+        gidToShards[gid] = make([]int, 0)
+        gids = append(gids, gid)
+    }
+    sort.Ints(gids) // Sort to ensure deterministic iteration across all Raft peers
+
+    // 2. Find unassigned shards
+    var unassigned []int
+    for shard, gid := range config.Shards {
+        if _, exists := config.Groups[gid]; exists {
+            gidToShards[gid] = append(gidToShards[gid], shard)
+        } else {
+            unassigned = append(unassigned, shard)
+        }
+    }
+
+    // 3. Assign unassigned shards to the GID with the minimum shards
+    for _, shard := range unassigned {
+        minGid := gids[0]
+        for _, gid := range gids {
+            if len(gidToShards[gid]) < len(gidToShards[minGid]) {
+                minGid = gid
+            }
+        }
+        config.Shards[shard] = minGid
+        gidToShards[minGid] = append(gidToShards[minGid], shard)
+    }
+
+    // 4. Balance shards among valid GIDs
+    for {
+        maxGid, minGid := gids[0], gids[0]
+        for _, gid := range gids {
+            if len(gidToShards[gid]) > len(gidToShards[maxGid]) {
+                maxGid = gid
+            }
+            if len(gidToShards[gid]) < len(gidToShards[minGid]) {
+                minGid = gid
+            }
+        }
+
+        // If the difference between max and min is <= 1, it's balanced
+        if len(gidToShards[maxGid])-len(gidToShards[minGid]) <= 1 {
+            break
+        }
+
+        // Move one shard from maxGid to minGid
+        shard := gidToShards[maxGid][0]
+        gidToShards[maxGid] = gidToShards[maxGid][1:]
+        gidToShards[minGid] = append(gidToShards[minGid], shard)
+        config.Shards[shard] = minGid
+    }
+}
 
 func (sc *ShardCtrler) Join(args *JoinArgs, reply *JoinReply) {
-	// Your code here. 
-	sc.configs = append(sc.configs, Config{})
-	sc.configs[len(sc.configs)-1].Groups = args.Servers
-	sc.configs[len(sc.configs)-1].Num = len(sc.configs) - 1
-	sc.configNum = len(sc.configs) - 1
-	// TODO: reassign shards
+    reqId := time.Now().UnixNano()
+    op := Op{Type: Join, Servers: args.Servers, ReqId: reqId}
+    index, _, isLeader := sc.rf.Start(op)
+    if !isLeader {
+        reply.WrongLeader = true
+        return
+    }
+
+    ch := sc.getWaitCh(index)
+    defer func() {
+        sc.mu.Lock()
+        delete(sc.waitCh, index)
+        sc.mu.Unlock()
+    }()
+
+    opApplied := <-ch
+    if opApplied.ReqId != reqId {
+        reply.WrongLeader = true
+    } else {
+        reply.WrongLeader = false
+        reply.Err = OK
+    }
 }
 
 func (sc *ShardCtrler) Leave(args *LeaveArgs, reply *LeaveReply) {
-	// Your code here.
-	sc.configs = append(sc.configs, Config{})
-	sc.configs[len(sc.configs)-1].Num = len(sc.configs) - 1
-	sc.configs[len(sc.configs)-1].Groups = sc.configs[len(sc.configs)-2].Groups
-	for _, gid := range args.GIDs {
-		delete(sc.configs[len(sc.configs)-1].Groups, gid)
-	}
-	sc.configNum = len(sc.configs) - 1
+    reqId := time.Now().UnixNano()
+    op := Op{Type: Leave, GIDs: args.GIDs, ReqId: reqId}
+    index, _, isLeader := sc.rf.Start(op)
+    if !isLeader {
+        reply.WrongLeader = true
+        return
+    }
+
+    ch := sc.getWaitCh(index)
+    defer func() {
+        sc.mu.Lock()
+        delete(sc.waitCh, index)
+        sc.mu.Unlock()
+    }()
+
+    opApplied := <-ch
+    if opApplied.ReqId != reqId {
+        reply.WrongLeader = true
+    } else {
+        reply.WrongLeader = false
+        reply.Err = OK
+    }
 }
 
 func (sc *ShardCtrler) Move(args *MoveArgs, reply *MoveReply) {
-	// Your code here.
-	sc.configs = append(sc.configs, Config{})
-	sc.configs[len(sc.configs)-1].Num = len(sc.configs) - 1
-	sc.configs[len(sc.configs)-1].Groups = sc.configs[len(sc.configs)-2].Groups
-	sc.configs[len(sc.configs)-1].Shards[args.Shard] = args.GID
-	sc.configNum = len(sc.configs) - 1
+    reqId := time.Now().UnixNano()
+    op := Op{Type: Move, Shard: args.Shard, GID: args.GID, ReqId: reqId}
+    index, _, isLeader := sc.rf.Start(op)
+    if !isLeader {
+        reply.WrongLeader = true
+        return
+    }
+
+    ch := sc.getWaitCh(index)
+    defer func() {
+        sc.mu.Lock()
+        delete(sc.waitCh, index)
+        sc.mu.Unlock()
+    }()
+
+    opApplied := <-ch
+    if opApplied.ReqId != reqId {
+        reply.WrongLeader = true
+    } else {
+        reply.WrongLeader = false
+        reply.Err = OK
+    }
 }
 
 func (sc *ShardCtrler) Query(args *QueryArgs, reply *QueryReply) {
-	// Your code here.
-	if args.Num == -1 || args.Num >= len(sc.configs) {
-		reply.Config = sc.configs[len(sc.configs)-1]
-	} else {
-		reply.Config = sc.configs[args.Num]
-	}
+    reqId := time.Now().UnixNano()
+    op := Op{Type: Query, Num: args.Num, ReqId: reqId}
+    index, _, isLeader := sc.rf.Start(op)
+    if !isLeader {
+        reply.WrongLeader = true
+        return
+    }
+
+    ch := sc.getWaitCh(index)
+    defer func() {
+        sc.mu.Lock()
+        delete(sc.waitCh, index)
+        sc.mu.Unlock()
+    }()
+
+    opApplied := <-ch
+    if opApplied.ReqId != reqId {
+        reply.WrongLeader = true
+    } else {
+        reply.WrongLeader = false
+        reply.Err = OK
+
+        sc.mu.Lock()
+        if args.Num == -1 || args.Num >= len(sc.configs) {
+            reply.Config = sc.configs[len(sc.configs)-1]
+        } else {
+            reply.Config = sc.configs[args.Num]
+        }
+        sc.mu.Unlock()
+    }
 }
 
-
-// the tester calls Kill() when a ShardCtrler instance won't
-// be needed again. you are not required to do anything
-// in Kill(), but it might be convenient to (for example)
-// turn off debug output from this instance.
 func (sc *ShardCtrler) Kill() {
-	sc.rf.Kill()
-	// Your code here, if desired.
+    sc.dead.Store(true)
+    sc.rf.Kill()
 }
 
-// needed by shardkv tester
 func (sc *ShardCtrler) Raft() *raft.Raft {
-	return sc.rf
+    return sc.rf
 }
 
-// servers[] contains the ports of the set of
-// servers that will cooperate via Raft to
-// form the fault-tolerant shardctrler service.
-// me is the index of the current server in servers[].
 func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister) *ShardCtrler {
-	sc := new(ShardCtrler)
-	sc.me = me
+    sc := new(ShardCtrler)
+    sc.me = me
+    sc.dead.Store(true)
 
-	sc.configs = make([]Config, 1)
-	sc.configs[0].Groups = map[int][]string{}
+    sc.configs = make([]Config, 1)
+    sc.configs[0].Groups = map[int][]string{}
+    sc.waitCh = make(map[int]chan Op)
 
-	labgob.Register(Op{})
-	sc.applyCh = make(chan raft.ApplyMsg)
-	sc.rf = raft.Make(servers, me, persister, sc.applyCh)
+    labgob.Register(Op{})
+    sc.applyCh = make(chan raft.ApplyMsg)
+    sc.rf = raft.Make(servers, me, persister, sc.applyCh)
 
-	// Your code here.
+    go sc.apply()
 
-	return sc
+    return sc
+}
+
+func (sc *ShardCtrler) getWaitCh(index int) chan Op {
+    sc.mu.Lock()
+    defer sc.mu.Unlock()
+    if _, ok := sc.waitCh[index]; !ok {
+        sc.waitCh[index] = make(chan Op, 1)
+    }
+    return sc.waitCh[index]
+}
+
+func (sc *ShardCtrler) apply() {
+    for msg := range sc.applyCh {
+        if msg.CommandValid {
+            op := msg.Command.(Op)
+
+            sc.mu.Lock()
+
+            if op.Type == Join {
+                // Idempotency check: only append if it actually adds new groups
+                isDup := true
+                lastConfig := sc.configs[len(sc.configs)-1]
+                for gid := range op.Servers {
+                    if _, ok := lastConfig.Groups[gid]; !ok {
+                        isDup = false
+                        break
+                    }
+                }
+                if !isDup {
+                    nextConfig := sc.createNextConfig()
+                    for gid, servers := range op.Servers {
+                        nextConfig.Groups[gid] = append([]string{}, servers...)
+                    }
+                    rebalance(&nextConfig)
+                    sc.configs = append(sc.configs, nextConfig)
+                }
+            } else if op.Type == Leave {
+                // Idempotency check: only append if it actually removes existing groups
+                isDup := true
+                lastConfig := sc.configs[len(sc.configs)-1]
+                for _, gid := range op.GIDs {
+                    if _, ok := lastConfig.Groups[gid]; ok {
+                        isDup = false
+                        break
+                    }
+                }
+                if !isDup {
+                    nextConfig := sc.createNextConfig()
+                    for _, gid := range op.GIDs {
+                        delete(nextConfig.Groups, gid)
+                    }
+                    rebalance(&nextConfig)
+                    sc.configs = append(sc.configs, nextConfig)
+                }
+            } else if op.Type == Move {
+                lastConfig := sc.configs[len(sc.configs)-1]
+                if lastConfig.Shards[op.Shard] != op.GID {
+                    nextConfig := sc.createNextConfig()
+                    nextConfig.Shards[op.Shard] = op.GID
+                    sc.configs = append(sc.configs, nextConfig)
+                }
+            }
+
+            // Notify the waiting RPC handler
+            if ch, ok := sc.waitCh[msg.CommandIndex]; ok {
+                ch <- op
+            }
+
+            sc.mu.Unlock()
+        }
+    }
 }
